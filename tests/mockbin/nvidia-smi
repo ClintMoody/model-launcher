@@ -1,0 +1,10 @@
+#!/bin/bash
+# mock nvidia-smi
+for a in "$@"; do
+  case "$a" in
+    *query-gpu=memory.used*) printf '0\n0\n' ;;        # both GPUs free
+    *query-gpu=index,memory.used*) printf '0, 0\n1, 0\n' ;;
+    *query-compute-apps*) printf '' ;;
+  esac
+done
+exit 0

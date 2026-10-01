@@ -1,0 +1,191 @@
+#!/bin/bash
+# llm-switch (registry-driven): flip the serving model between registered engines and keep Hermes in step.
+# Engines, units, ports, model names, boot budgets, and Hermes profiles all come from engines.json
+# (via registry.py), not from hardcoded maps. The lifecycle (lock, busy guard, stop-all, wait-for-GPU,
+# start, health poll, smoke test, rollback, --preempt, --force) is the same as the original.
+#
+#   llm-switch <engine-id>          -> switch to that registered engine
+#   llm-switch status | hermes-sync (match Hermes to what is serving) | hermes-apply <engine-id>
+#   llm-switch effort off|low|medium|xhigh   (Hermes thinking effort now, no switch)
+# Flags: --no-rollback, --force, --effort=<level>, --preempt
+# Env:   LAUNCHER_REGISTRY (default ~/.config/model-launcher/engines.json)
+#        LAUNCHER_HERMES_CFG (path to hermes_cfg.py; default next to this script)
+#        LAUNCHER_PORT (default 8081; the serving port the health/smoke probes hit)
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REG="${LAUNCHER_REGISTRY:-$HOME/.config/model-launcher/engines.json}"
+H="${LAUNCHER_HERMES_CFG:-$HERE/../hermes_cfg.py}"
+PORT="${LAUNCHER_PORT:-8081}"
+REGPY="$HERE/../registry.py"
+
+# Load the registry into bash assoc arrays + the target id list. Fails loudly if the registry is bad.
+if [ ! -f "$REG" ]; then echo "ERROR: registry not found: $REG"; exit 2; fi
+REGGEN="$(python3 "$REGPY" "$REG" 2>&1)" || { echo "ERROR: registry load failed: $REGGEN"; exit 2; }
+eval "$REGGEN"
+# ordered list of target ids (ALL = every unit the switch may stop)
+ALL=$(python3 -c "import json,sys;print(' '.join(e['unit'] for e in json.load(open('$REG'))['engines']))" 2>/dev/null)
+ALLUNITS=$(python3 -c "import json;print(' '.join(e['unit'] for e in json.load(open('$REG'))['engines']))")
+IDS=$(python3 -c "import json;print(' '.join(e['id'] for e in json.load(open('$REG'))['engines']))")
+SC="systemctl --user"
+LOCK=${XDG_RUNTIME_DIR:-/tmp}/llm-switch.lock
+PREEMPT=0
+
+# --- Hermes profile from the registry (replaces the hardcoded case) ---
+hermes_profile() {  # $1 = engine id; prints "key value" lines (or nothing if engine has no hermes block)
+  python3 - "$REGPY" "$REG" "$1" <<'PY'
+import sys, importlib.util
+spec = importlib.util.spec_from_file_location("registry", sys.argv[1])
+m = importlib.util.module_from_spec(spec); import sys as _s; _s.modules["registry"]=m; spec.loader.exec_module(m)
+eng = m.load(sys.argv[2])
+for line in m.to_hermes_lines(sys.argv[3], eng):
+    print(line)
+PY
+}
+
+# busy requests on the serving port (vLLM exposes /metrics; engines that don't -> 0)
+busy_requests() {
+  curl -s -m 3 "localhost:$PORT/metrics" 2>/dev/null | awk '/^vllm:num_requests_(running|waiting)\{/{s+=$2} END{print int(s)}'
+}
+
+# wait until every GPU is under the target's gpu_free_mib (default 1500)
+wait_gpus_free() {
+  local threshold="${1:-1500}"
+  for i in $(seq 1 60); do
+    busy=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | awk -v t="$threshold" '$1>t' | wc -l)
+    [ "$busy" = 0 ] && return 0; sleep 2
+  done
+  echo "GPUs still busy after 120s:"; nvidia-smi --query-compute-apps=pid,used_memory --format=csv 2>/dev/null; return 1
+}
+
+# wait for the target engine's health_url to answer, up to its boot_budget_s
+wait_up() {  # $1 = target engine id
+  local t0=$(date +%s) u="${UNIT[$1]:-}" budget="${BOOT[$1]:-600}"
+  local health="${HEALTHURL[$1]:-http://127.0.0.1:$PORT/v1/models}"
+  while :; do
+    curl -sf -m 3 "$health" >/dev/null && { echo "UP after $(( $(date +%s)-t0 ))s"; return 0; }
+    [ -n "$u" ] && $SC is-failed -q "$u" && { echo "$u FAILED"; journalctl --user -u "$u" -n 30 --no-pager 2>/dev/null; return 1; }
+    [ $(( $(date +%s)-t0 )) -gt "$budget" ] && { echo "TIMEOUT after ${budget}s"; return 1; }
+    echo "  waiting... $(( $(date +%s)-t0 ))s"; sleep 10
+  done
+}
+
+active_target() {  # which engine id is serving (empty if none)
+  local t
+  for t in $IDS; do $SC is-active -q "${UNIT[$t]}" && { echo "$t"; return; }; done
+}
+
+status() {
+  for t in $IDS; do printf '%-22s %-26s %s\n' "$t" "${UNIT[$t]}" "$($SC is-active "${UNIT[$t]}" 2>/dev/null)"; done
+  printf 'port %s models:            %s\n' "$PORT" "$(curl -s -m 3 "localhost:$PORT/v1/models" | python3 -c 'import sys,json;print(", ".join(m["id"] for m in json.load(sys.stdin)["data"]))' 2>/dev/null || echo DOWN)"
+  nvidia-smi --query-gpu=index,memory.used --format=csv,noheader 2>/dev/null | sed 's/^/GPU /'
+  printf 'hermes:                    reasoning %s, %s subagents, %ss subagent timeout\n' "$(python3 "$H" get agent.reasoning_effort 2>/dev/null)" "$(python3 "$H" get delegation.max_concurrent_children 2>/dev/null)" "$(python3 "$H" get delegation.child_timeout_seconds 2>/dev/null)"
+}
+
+apply_hermes() {  # $1 = engine id that is serving
+  [ -f ~/.hermes/config.yaml ] || { echo "no Hermes config; skipping Hermes profile"; return 0; }
+  local changed=0 k v cur
+  while read -r k v; do
+    [ -z "$k" ] && continue
+    cur=$(python3 "$H" get "$k" 2>/dev/null)
+    if [ "$cur" != "$v" ]; then
+      [ $changed = 0 ] && cp ~/.hermes/config.yaml ~/.hermes/config.yaml.bak-llm-switch-latest
+      if python3 "$H" set "$k" "$v"; then echo "hermes: $k ${cur:-<unset>} -> $v"; else echo "hermes: FAILED to set $k"; fi
+      changed=1
+    fi
+  done < <(hermes_profile "$1")
+  [ $changed = 0 ] && echo "hermes: already on the $1 profile"
+  return 0
+}
+
+smoke() {  # $1 = engine id; one real completion using the engine's api_name
+  local model="${APINAME[$1]}"
+  curl -s -m 120 "localhost:$PORT/v1/chat/completions" -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$model\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly: ready\"}],\"max_tokens\":8,\"temperature\":0,\"chat_template_kwargs\":{\"enable_thinking\":false}}" \
+    | python3 -c 'import sys,json;print("smoke:", json.load(sys.stdin)["choices"][0]["message"]["content"].strip())' 2>/dev/null || echo "smoke FAILED"
+}
+
+switch() {
+  local tgt=$1 rollback=$2
+  [ -n "${UNIT[$tgt]:-}" ] || { echo "unknown target: $tgt ($IDS)"; exit 2; }
+  # optional mount requirement from the registry
+  local mountreq
+  mountreq=$(python3 -c "import json;print((json.load(open('$REG'))['engines'] and [e for e in json.load(open('$REG'))['engines'] if e['id']=='$tgt'][0].get('require_mount') or ''))")
+  [ -n "$mountreq" ] && ! mountpoint -q "$mountreq" && { echo "ERROR: $mountreq (required by $tgt) is not mounted"; exit 1; }
+  echo "stopping current server(s)..."
+  if [ $PREEMPT = 1 ] && { $SC is-active -q "${UNIT[$tgt]}" || [ "$($SC is-active "${UNIT[$tgt]}" 2>/dev/null)" = activating ]; }; then
+    echo "${UNIT[$tgt]} is already loading; waiting for it instead of restarting it"
+    if wait_up $tgt; then
+      smoke $tgt
+      apply_hermes $tgt; status; echo "DONE: $tgt is serving"; return 0
+    fi
+    echo "FAILED: $tgt did not come up"; return 1
+  fi
+  local serving=0; curl -sf -m 3 "localhost:$PORT/v1/models" >/dev/null && serving=1
+  local u
+  for u in $ALLUNITS; do
+    [ "$u" = "${UNIT[$tgt]}" ] && continue
+    $SC is-active -q "$u" || [ "$($SC is-active "$u" 2>/dev/null)" = activating ] || continue
+    if [ $PREEMPT = 1 ] && [ $serving = 0 ]; then
+      echo "  aborting half-loaded $u"
+      $SC stop --no-block "$u" 2>/dev/null
+      [ -n "${CONTAINER[$u]:-}" ] && docker kill "${CONTAINER[$u]}" >/dev/null 2>&1
+      for i in $(seq 1 60); do $SC is-active -q "$u" || [ "$($SC is-active "$u" 2>/dev/null)" = activating ] || break; sleep 1; done
+    else
+      $SC stop "$u" 2>/dev/null
+    fi
+  done
+  # remove any containers from the registry (for a clean GPU-free state)
+  local containers; containers=$(python3 -c "import json;print(' '.join(e['container'] for e in json.load(open('$REG'))['engines'] if e.get('container')))")
+  [ -n "$containers" ] && docker rm -f $containers >/dev/null 2>&1
+  wait_gpus_free "$(python3 -c "import json;print((json.load(open('$REG'))['engines'] and [e for e in json.load(open('$REG'))['engines'] if e['id']=='$tgt'][0].get('gpu_free_mib',1500)))")" || exit 1
+  echo "starting ${UNIT[$tgt]} (up to ${BOOT[$tgt]}s)..."
+  $SC start "${UNIT[$tgt]}"
+  if wait_up $tgt; then
+    smoke $tgt
+    apply_hermes $tgt
+    status; echo "DONE: $tgt is serving"; return 0
+  fi
+  if [ "$rollback" = 1 ] && [ -n "${DEFAULT:-}" ] && [ "$tgt" != "$DEFAULT" ]; then
+    echo "!! $tgt did not come up; rolling back to $DEFAULT"; $SC stop "${UNIT[$tgt]}" 2>/dev/null; switch "$DEFAULT" 0; return 1
+  fi
+  echo "FAILED: $tgt did not come up"
+  return 1
+}
+
+CMD="${1:-status}"
+case "$CMD" in
+  status) status ;;
+  effort)
+    EFFORT=$(case "${2:-}" in off|none) echo none;; low|medium|xhigh) echo "$2";; high|max) echo xhigh;; minimal) echo low;; *) return 1;; esac) || { echo "usage: llm-switch effort off|low|medium|xhigh"; exit 2; }
+    cur=$(python3 "$H" get agent.reasoning_effort 2>/dev/null)
+    [ "$cur" = "$EFFORT" ] && echo "hermes: thinking effort already $EFFORT" || { cp ~/.hermes/config.yaml ~/.hermes/config.yaml.bak-llm-switch-latest; python3 "$H" set agent.reasoning_effort "$EFFORT" && echo "hermes: agent.reasoning_effort ${cur:-<unset>} -> $EFFORT (takes effect on Hermes' next turn)"; } ;;
+  hermes-apply) [ -n "${2:-}" ] || { echo "usage: llm-switch hermes-apply <engine-id>"; exit 2; }; [ -n "${UNIT[$2]+set}" ] || { echo "unknown target: $2"; exit 2; }; apply_hermes "$2" ;;
+  hermes-sync) t=$(active_target); [ -n "$t" ] && apply_hermes $t || echo "no server active; Hermes left as is" ;;
+  hermes-apply) [ -n "${2:-}" ] || { echo "usage: llm-switch hermes-apply <engine-id>"; exit 2; }; [ -n "${UNIT[$2]+set}" ] || { echo "unknown target: $2"; exit 2; }; apply_hermes "$2" ;;
+  hermes-sync) t=$(active_target); [ -n "$t" ] && apply_hermes $t || echo "no server active; Hermes left as is" ;;
+  *)
+    # any other arg: must be a registered engine id to switch to
+    if [ -z "${UNIT[$CMD]+set}" ]; then echo "unknown target: $CMD (registered: $IDS)"; sed -n '2,14p' "$0"; exit 2; fi
+    rb=1; force=0; EFFORT=""
+    for a in "${@:2}"; do case $a in
+      --no-rollback) rb=0 ;; --force) force=1 ;;
+      --effort=*) case "${a#--effort=}" in off|none) EFFORT=none;; low|medium|xhigh) EFFORT="${a#--effort=}";; high|max) EFFORT=xhigh;; minimal) EFFORT=low;; *) echo "bad effort"; exit 2;; esac ;;
+      --preempt) PREEMPT=1 ;;
+    esac; done
+    exec 9>>"$LOCK"
+    if ! flock -n 9; then
+      [ $PREEMPT = 1 ] || { echo "ERROR: another switch is already running (use --preempt to take over)"; exit 3; }
+      old=$(cat "$LOCK.pid" 2>/dev/null)
+      echo "taking over from the running switch${old:+ (pid $old)}"
+      [ -n "$old" ] && kill "$old" 2>/dev/null
+      flock -w 20 9 || { echo "ERROR: the running switch did not stop"; exit 3; }
+    fi
+    echo $$ > "$LOCK.pid"
+    if [ "$(active_target)" = "$CMD" ] && curl -sf -m 3 "localhost:$PORT/v1/models" >/dev/null; then
+      echo "$CMD is already serving"; apply_hermes "$CMD"; echo "DONE: $CMD is serving"; exit 0
+    fi
+    b=$(busy_requests); [ -z "$b" ] && b=0
+    if [ "$b" -gt 0 ] && [ $force = 0 ]; then echo "BUSY: the current server has $b request(s) in flight. Re-run with --force to switch anyway."; exit 4; fi
+    switch "$CMD" $rb ;;
+esac

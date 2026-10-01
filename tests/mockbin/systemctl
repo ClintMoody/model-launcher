@@ -1,0 +1,19 @@
+#!/bin/bash
+# mock systemctl for tests
+LOG="${MOCK_LOG:-/tmp/mock-systemctl.log}"
+case "$1" in
+  --user) shift ;;
+esac
+cmd="${1:-}"
+rest="${*:2}"
+echo "$cmd $rest" >> "$LOG"
+case "$cmd" in
+  is-active)
+    # active if the unit is in $MOCK_ACTIVE_UNITS
+    unit="${rest#-q }"
+    for u in ${MOCK_ACTIVE_UNITS:-}; do [ "$u" = "$unit" ] && { echo active; exit 0; }; done
+    echo inactive; exit 0 ;;
+  is-failed) echo inactive; exit 0 ;;
+  start|stop) echo "$cmd $rest"; exit 0 ;;
+  *) exit 0 ;;
+esac

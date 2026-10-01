@@ -1,0 +1,11 @@
+#!/bin/bash
+# mock curl: find the URL arg (the one starting with http)
+url=""
+for a in "$@"; do case "$a" in http*) url="$a";; esac; done
+case "$url" in
+  *"/v1/models") echo '{"data":[{"id":"alfred"}]}' ;;
+  *"/v1/chat/completions") echo '{"choices":[{"message":{"content":"ready"}}]}' ;;
+  *"/metrics") echo '' ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
