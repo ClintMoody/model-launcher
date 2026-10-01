@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.venv/
+# the registry is per-machine data; the example is committed, the live one is not
+engines.json
+onboarding.json
+*.bak-install-*
+*.bak-llm-switch-*

@@ -1,0 +1,23 @@
+[project]
+name = "model-launcher"
+version = "0.1.0"
+description = "Generalized LLM Launcher: registry-driven engine switching, Tailscale-reachable, agent-controllable, Hermes plug-and-play."
+requires-python = ">=3.9"
+# stdlib-only runtime: no third-party dependencies. dev tools below are not shipped.
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["server", "registry", "hermes_cfg"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
