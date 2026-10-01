@@ -1,0 +1,15 @@
+[Unit]
+Description=model-launcher: registry-driven LLM engine switcher (web UI + JSON API)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=%h/.local/lib/model-launcher
+Environment=LAUNCHER_REGISTRY=%h/.config/model-launcher/engines.json
+Environment=LAUNCHER_HERMES_CFG=%h/.local/lib/model-launcher/hermes_cfg.py
+ExecStart=%h/.local/bin/python3 %h/.local/lib/model-launcher/server.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

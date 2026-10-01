@@ -184,7 +184,12 @@ def tail(n):
 
 
 def journal_since(unit, since):
-    return sh(["journalctl", "--user", "-u", unit, "--since", f"@{int(since)}", "-o", "cat", "--no-pager"], timeout=15)
+    if not unit:
+        return tail(200)
+    args = ["journalctl", "--user", "-u", unit, "-n", "200", "-o", "cat", "--no-pager"]
+    if since:
+        args += ["--since", f"@{int(since)}"]
+    return sh(args, timeout=15)
 
 
 def detect():
@@ -414,7 +419,14 @@ class H(BaseHTTPRequestHandler):
             return self.send(200, {"engines": _engine_dicts(engines), "states": states})
         if self.path == "/api/status":
             return self.send(200, status())
-        if self.path == "/api/journal":
+        if self.path.startswith("/api/journal"):
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(self.path).query)
+            tgt = q.get("target", [None])[0]
+            if tgt:
+                engines, _ = _load_registry()
+                eng = next((e for e in engines if e.id == tgt), None)
+                return self.send(200, {"log": journal_since(eng.unit if eng else None, None)})
             return self.send(200, {"log": tail(100000)})
         self.send(404, {"error": "not found"})
 

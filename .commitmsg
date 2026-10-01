@@ -1,16 +1,15 @@
-wave 2: registry-driven llm-switch + generalized server.py + auth
+wave 3: installer, agent contract, onboarding prompt, web UI
 
-T4: bin/llm-switch reads engines.json (UNIT/BOOT/CONTAINER/APINAME/HEALTHURL via registry.py eval).
-  hermes profile, smoke model name, gpu-free threshold, mount check all registry-driven. Lifecycle
-  (lock/busy/stop-all/wait-gpu/start/health/smoke/rollback/preempt/force) preserved. 3 tests against
-  mock systemctl/nvidia-smi/curl (stop-other + start-target + hermes-write, unknown-target, status).
+T6: install.sh (dry-run-first probe: Tailscale/Docker/NVIDIA/Ollama/Hermes; seeds the registry
+  with an Ollama prefill or a blank openai-compatible slot; writes the systemd user unit;
+  --apply / --uninstall). check-secrets.sh (credential-pattern gate before every push).
+  systemd/model-launcher.service. AGENTS.md (the full operating contract an AI agent reads to
+  drive the launcher: API table, onboarding procedure, invariants, gotchas).
+  docs/onboarding-agent-checklist.md (the prompt the friend pastes to his own agent).
 
-T5: server.py generalized: registry load at boot (fail loudly if malformed); endpoints /api/detect,
-  /api/engines CRUD, /api/validate (three-step gate), /api/switch, /api/effort, /api/hermes-sync,
-  /api/journal, /api/config. Bearer-token auth on mutating endpoints (403 without); read open. 4 tests.
+T7: index.html web UI - engine cards from the registry, live states, effort picker, switch/preempt
+  buttons, measured progress bar, GPU/RAM/Hermes pills, per-engine log view. Consumes the real
+  /api/status shape. server.py journal endpoint gained a ?target= filter (per-engine unit log).
+  journal_since now handles None unit/since (falls back to the generic tail).
 
-Bug fixes found during build:
-- importlib + Python 3.14 @dataclass needs sys.modules registration before exec_module.
-- bash case cannot word-split a variable as a pattern list; use a membership check.
-- ${UNIT[k]:-} is unbound under set -u for a missing assoc key; use ${UNIT[k]+set}.
-- python http.server needs an explicit from-import, not __import__ (returns the parent package).
+Phase 01 of the model-launcher build complete.

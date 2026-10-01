@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Model Launcher</title>
+<style>
+  :root{--bg:#0b0e14;--panel:#12161f;--panel2:#181d29;--line:#232a3a;--fg:#e8edf5;--dim:#8b96ab;
+        --ok:#3ddc84;--warn:#ffb454;--err:#ff5d5d;--info:#58a6ff;--accent:#7c5cff;}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,Segoe UI,Roboto,sans-serif;padding:22px}
+  h1{font-size:20px;margin:0 0 4px}
+  .sub{color:var(--dim);font-size:13px;margin-bottom:18px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:15px}
+  .card.active{border-color:var(--ok);box-shadow:0 0 0 1px var(--ok) inset}
+  .card h2{font-size:16px;margin:0}
+  .badge{display:inline-block;font-size:11px;padding:2px 8px;border-radius:999px;margin-left:8px;vertical-align:middle}
+  .meta{color:var(--dim);font-size:12.5px;margin:8px 0 12px;min-height:32px}
+  .meta .up{color:var(--ok)} .meta .down{color:var(--err)}
+  .effort{display:flex;align-items:center;gap:8px;margin-bottom:12px;font-size:13px}
+  select{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:6px 8px;font-size:13px}
+  .row{display:flex;gap:8px;flex-wrap:wrap}
+  button{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:8px;
+         padding:9px 14px;font-size:13.5px;cursor:pointer}
+  button:hover{border-color:var(--info)}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+  button.danger{border-color:var(--err);color:var(--err)}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  .bar-wrap{margin-top:12px;display:none}
+  .bar{height:10px;background:var(--panel2);border-radius:999px;overflow:hidden}
+  .bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--info));transition:width .5s}
+  .bar-text{font-size:12px;color:var(--dim);margin-top:6px}
+  .bar-sub{font-size:11.5px;color:var(--dim);margin-top:4px;font-family:ui-monospace,monospace}
+  .global{margin-top:20px;display:flex;gap:14px;flex-wrap:wrap;align-items:center}
+  .pill{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:8px 12px;font-size:12.5px;color:var(--dim)}
+  .pill b{color:var(--fg)}
+  .note{color:var(--dim);font-size:12px;margin-top:20px;max-width:640px}
+  code{background:var(--panel2);padding:1px 6px;border-radius:5px;font-size:12px}
+</style>
+</head>
+<body>
+  <h1>Model Launcher</h1>
+  <div class="sub">registry-driven engine switcher</div>
+  <div class="grid" id="cards"></div>
+  <div class="global">
+    <div class="pill">GPU mem: <b id="gpu">—</b></div>
+    <div class="pill">RAM: <b id="ram">—</b></div>
+    <div class="pill">Hermes: <b id="hermes">—</b></div>
+    <button class="primary" id="sync" onclick="hermesSync()">Sync Hermes to active</button>
+  </div>
+  <div class="note">One engine owns the GPU at a time. The <b>default</b> badge marks the rollback target.
+    A switch stops everything, waits for the GPU to free, starts the target, waits for its health endpoint,
+    then runs one real completion as a smoke test. Click <b>instead</b> on a card to preempt a switch that is
+    already loading a different engine.</div>
+  <script>
+    const $=id=>document.getElementById(id);
+    let last=null;
+    const EFFORTS=["off","low","medium","xhigh"];
+    const stateColor=s=>s==="active"?"var(--ok)":(s==="down"?"var(--err)":"var(--dim)");
+
+    function effortOpts(sel){return ["default"].concat(EFFORTS).map(v=>
+      `<option value="${v}" ${v===(sel||"default")?"selected":""}>${v==="default"?"default":v}</option>`).join("");}
+
+    function render(d){
+      last=d;
+      if(!d.engines||!d.engines.length){
+        $("cards").innerHTML=`<div class="card"><h2>No engines registered</h2>
+          <div class="meta">Run the onboarding prompt (AGENTS.md) or <code>POST /api/engines</code> to add one.</div></div>`;
+      } else {
+        const states=d.states||{};
+        $("cards").innerHTML=d.engines.map(e=>{
+          const a=e.id===d.active, st=states[e.id]||"inactive", up=(a&&d.up);
+          const prog=(d.job&&d.job.progress&&d.job.target===e.id)?d.job.progress:null;
+          const sub=prog&&prog.detail?` · ${prog.detail}`:(prog&&prog.sub?` · GPU ${(prog.sub*100).toFixed(0)}% loaded`:"");
+          const activeBtn=a
+            ? `<button class="primary" disabled>active</button>`
+            : (d.job&&d.job.running&&d.job.target!==e.id
+                ? `<button class="danger" onclick="doSwitch('${e.id}',true)">instead</button>`
+                : `<button class="primary" onclick="doSwitch('${e.id}',false)">switch</button>`);
+          return `<div class="card ${a?"active":""}">
+            <h2>${e.label||e.id}<span class="badge" style="background:${stateColor(st)}22;color:${stateColor(st)}">${st}</span>${e.default?'<span class="badge" style="background:#2b2440;color:var(--accent)">default</span>':""}</h2>
+            <div class="meta">serves <code>${e.api_name}</code> · port ${e.port} · ${up?'<span class="up">serving</span>':'<span class="down">not up</span>'}${a?sub:""}</div>
+            <div class="effort">thinking <select onchange="setEffort(this.value)">${effortOpts(e.hermes&&e.hermes.reasoning_effort)}</select></div>
+            <div class="row">${activeBtn}
+              <button onclick="journal('${e.id}')">log</button></div>
+            <div class="bar-wrap" id="bar-${e.id}"><div class="bar"><i id="fill-${e.id}"></i></div>
+              <div class="bar-text" id="bt-${e.id}"></div><div class="bar-sub" id="bs-${e.id}"></div></div>
+          </div>`;
+        }).join("");
+      }
+      $("gpu").textContent=(d.gpus||[]).map(g=>`#${g.index} ${g.mem_used}/${g.mem_total}MiB`).join("   ")||"—";
+      const r=d.ram||{}; $("ram").textContent=r.total?`${(r.used/1024).toFixed(0)}/${(r.total/1024).toFixed(0)}G`:"—";
+      const h=d.hermes||{}; $("hermes").textContent=`${h.reasoning_effort||"off"} · ${h.max_concurrent_children||"-"} children · ${h.stale_timeout_seconds||"-"}s stale`;
+      // progress bar on the active/switching card
+      if(d.job&&d.job.target&&d.job.progress){
+        const t=d.job.target, bar=$("bar-"+t);
+        if(bar){
+          bar.style.display="block";
+          const pct=Math.max(4,d.job.progress.pct||0);
+          $("fill-"+t).style.width=pct+"%";
+          $("bt-"+t).textContent=`${t}: ${pct}%${d.job.progress.detail?" · "+d.job.progress.detail:""}`;
+          $("bs-"+t).textContent=d.job.started?`started ${new Date(d.job.started*1000).toLocaleTimeString()}`:"";
+        }
+      }
+    }
+    function doSwitch(id,preempt){
+      fetch("/api/switch",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({target:id,preempt:preempt,rollback:true})})
+        .then(r=>{ if(r.status===409){alert("A switch is already running. Use 'instead' to preempt it."); refresh();} })
+        .then(refresh).catch(e=>alert("switch error: "+e));
+    }
+    function setEffort(v){
+      fetch("/api/effort",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({effort:v==="default"?"medium":v})}).then(refresh).catch(e=>alert(e));
+    }
+    function hermesSync(){ fetch("/api/hermes-sync",{method:"POST"}).then(refresh).catch(e=>alert(e)); }
+    function journal(id){
+      fetch("/api/journal?target="+id).then(r=>r.json()).then(j=>{
+        const lines=(j.log||"").split("\n").slice(-50).map(l=>l.replace(/&/g,"&amp;").replace(/</g,"&lt;"));
+        const w=window.open("","log","width=760,height=540");
+        w.document.write(`<html><head><title>switch log</title>
+          <style>body{background:#0b0e14;color:#e8edf5;font:12px ui-monospace,monospace;padding:14px;margin:0}</style></head>
+          <body><pre style="white-space:pre-wrap;margin:0">${lines.join("\n")||"(no log yet)"}</pre></body></html>`);
+      }).catch(e=>alert(e));
+    }
+    function refresh(){ fetch("/api/status").then(r=>r.json()).then(render).catch(()=>{}); }
+    refresh(); setInterval(refresh,2000);
+  </script>
+</body>
+</html>
