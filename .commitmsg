@@ -1,15 +1,21 @@
-wave 3: installer, agent contract, onboarding prompt, web UI
+adversarial-review fixes (self-audit of the whole build)
 
-T6: install.sh (dry-run-first probe: Tailscale/Docker/NVIDIA/Ollama/Hermes; seeds the registry
-  with an Ollama prefill or a blank openai-compatible slot; writes the systemd user unit;
-  --apply / --uninstall). check-secrets.sh (credential-pattern gate before every push).
-  systemd/model-launcher.service. AGENTS.md (the full operating contract an AI agent reads to
-  drive the launcher: API table, onboarding procedure, invariants, gotchas).
-  docs/onboarding-agent-checklist.md (the prompt the friend pastes to his own agent).
+Found and fixed 3 real defects, each with a regression test that now stays enforced:
 
-T7: index.html web UI - engine cards from the registry, live states, effort picker, switch/preempt
-  buttons, measured progress bar, GPU/RAM/Hermes pills, per-engine log view. Consumes the real
-  /api/status shape. server.py journal endpoint gained a ?target= filter (per-engine unit log).
-  journal_since now handles None unit/since (falls back to the generic tail).
+1. Web UI broke once a token was set: the browser never sent the bearer token, so
+   switch/effort/hermes-sync from the UI returned 403. Fix: the server injects the
+   registry token into the served HTML (page only reachable over 127.0.0.1 + Tailscale)
+   and the UI's mutating fetches now carry it via X-Launcher-Token. Direct/API callers
+   still send their own token. Verified: no-token -> 403, with-token -> 202, token present
+   in served page, UI-style hermes-sync -> 200.
 
-Phase 01 of the model-launcher build complete.
+2. status() assumed the OpenAI /v1/models shape, so a non-OpenAI engine (Ollama /api/tags)
+   was never reported up and never showed its model list. Fix: the health probe now uses the
+   engine's registered health_url and parses OpenAI {"data":[{id}]} and Ollama {"models":[{name}]}
+   shapes, falling back to the registered api_name. Verified: an Ollama engine reports
+   up=True with its model names.
+
+3. journal_since crashed on a None unit/since. Fix: handle None (fall back to the generic tail).
+
+2 new regression tests in test_server.py (test_ui_token_injection_and_auth,
+test_status_reports_ollama_up_and_models). 19 tests total, all green.

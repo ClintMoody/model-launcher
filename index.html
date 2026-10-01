@@ -55,6 +55,8 @@
     already loading a different engine.</div>
   <script>
     const $=id=>document.getElementById(id);
+    const TOKEN="__UI_TOKEN__";
+    const H={headers:{"Content-Type":"application/json","X-Launcher-Token":TOKEN}};
     let last=null;
     const EFFORTS=["off","low","medium","xhigh"];
     const stateColor=s=>s==="active"?"var(--ok)":(s==="down"?"var(--err)":"var(--dim)");
@@ -105,16 +107,14 @@
       }
     }
     function doSwitch(id,preempt){
-      fetch("/api/switch",{method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({target:id,preempt:preempt,rollback:true})})
+      fetch("/api/switch",{method:"POST",headers:H.headers,body:JSON.stringify({target:id,preempt:preempt,rollback:true})})
         .then(r=>{ if(r.status===409){alert("A switch is already running. Use 'instead' to preempt it."); refresh();} })
         .then(refresh).catch(e=>alert("switch error: "+e));
     }
     function setEffort(v){
-      fetch("/api/effort",{method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({effort:v==="default"?"medium":v})}).then(refresh).catch(e=>alert(e));
+      fetch("/api/effort",{method:"POST",headers:H.headers,body:JSON.stringify({effort:v==="default"?"medium":v})}).then(refresh).catch(e=>alert(e));
     }
-    function hermesSync(){ fetch("/api/hermes-sync",{method:"POST"}).then(refresh).catch(e=>alert(e)); }
+    function hermesSync(){ fetch("/api/hermes-sync",{method:"POST",headers:H.headers}).then(refresh).catch(e=>alert(e)); }
     function journal(id){
       fetch("/api/journal?target="+id).then(r=>r.json()).then(j=>{
         const lines=(j.log||"").split("\n").slice(-50).map(l=>l.replace(/&/g,"&amp;").replace(/</g,"&lt;"));

@@ -282,11 +282,33 @@ def status():
             serve_port = e.port
             break
     models, up = [], False
-    try:
-        models = [m["id"] for m in _http_get_json(f"http://127.0.0.1:{serve_port}/v1/models")["data"]]
-        up = True
-    except Exception:
-        pass
+    active_eng = next((e for e in engines if e.id == active), None)
+    # try the engine's own health_url first (works for Ollama /api/tags, vLLM /v1/models, etc.)
+    if active_eng and active_eng.health_url:
+        try:
+            data = _http_get_json(active_eng.health_url)
+            up = True
+            if isinstance(data, dict):
+                # OpenAI-style /v1/models -> {"data":[{"id":..}]}
+                if "data" in data and isinstance(data["data"], list):
+                    models = [m.get("id") for m in data["data"] if isinstance(m, dict)]
+                # Ollama /api/tags -> {"models":[{"name":..}]}
+                elif "models" in data and isinstance(data["models"], list):
+                    models = [m.get("name") for m in data["models"] if isinstance(m, dict)]
+                # fallback: use the engine's registered api_name
+                if not models:
+                    models = [active_eng.api_name]
+            elif isinstance(data, list):
+                models = [data]
+        except Exception:
+            pass
+    if not up:
+        # last resort: the OpenAI endpoint on the serve port
+        try:
+            models = [m["id"] for m in _http_get_json(f"http://127.0.0.1:{serve_port}/v1/models")["data"]]
+            up = True
+        except Exception:
+            pass
     busy = 0
     try:
         r = _http_get_json(f"http://127.0.0.1:{serve_port}/metrics")
@@ -409,7 +431,14 @@ class H(BaseHTTPRequestHandler):
             p = os.path.join(HERE, "index.html")
             if os.path.exists(p):
                 with open(p, "rb") as f:
-                    return self.send(200, f.read(), "text/html; charset=utf-8")
+                    html = f.read().decode("utf-8", "replace")
+                # the browser UI authenticates its own mutating calls with the registry token,
+                # injected into the page (only reachable over 127.0.0.1 + Tailscale). Direct/API
+                # callers still send the token themselves; the page-bound copy is never logged.
+                _, cfg = _load_registry()
+                tok = cfg.get("token", "")
+                html = html.replace("__UI_TOKEN__", tok)
+                return self.send(200, html.encode("utf-8"), "text/html; charset=utf-8")
             return self.send(200, b"<h1>model-launcher</h1><p>web UI not built yet; use the JSON API.</p>", "text/html; charset=utf-8")
         if self.path == "/api/detect":
             return self.send(200, detect())
