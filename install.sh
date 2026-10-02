@@ -5,14 +5,30 @@
 #   - seeds the registry (~/.config/model-launcher/engines.json) with an Ollama prefill if
 #     Ollama is present, else a blank openai-compatible slot; the onboarding prompt/agent overrides it
 #   - NEVER starts or stops a model server; use the web UI / CLI / API for that
-# `--uninstall` removes the unit and the registry.
+# `--power` (opt-in, needs sudo) also installs the GPU power-cap control: /usr/local/bin/gpu-power,
+#   /etc/default/nvidia-power-limit (starts uncapped), gpu-power.service (re-applies the cap at boot)
+#   and a NOPASSWD sudoers rule for the installing user scoped to gpu-power only.
+# `--uninstall` removes the unit and the registry (with --power, also the power-cap pieces).
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-APPLY=0; UNINSTALL=0
+APPLY=0; UNINSTALL=0; POWER=0
 for a in "$@"; do case "$a" in
   --apply) APPLY=1 ;;
   --uninstall) UNINSTALL=1 ;;
+  --power) POWER=1 ;;
 esac; done
+ME="$(id -un)"
+
+install_power() {
+  echo "installing GPU power-cap control (sudo)"
+  sudo install -o root -g root -m 755 "$HERE/bin/gpu-power" /usr/local/bin/gpu-power || return 1
+  [ -f /etc/default/nvidia-power-limit ] || printf 'ENABLED=0\nCAP=0\n' | sudo tee /etc/default/nvidia-power-limit >/dev/null
+  sudo install -o root -g root -m 644 "$HERE/systemd/gpu-power.service" /etc/systemd/system/gpu-power.service
+  tmp="$(mktemp)"; echo "$ME ALL=(root) NOPASSWD: /usr/local/bin/gpu-power" > "$tmp"
+  sudo visudo -cf "$tmp" >/dev/null && sudo install -o root -g root -m 440 "$tmp" /etc/sudoers.d/gpu-power; rm -f "$tmp"
+  sudo systemctl daemon-reload && sudo systemctl enable gpu-power.service
+  echo "power-cap control installed: gpu-power $(/usr/local/bin/gpu-power status | head -c 60)..."
+}
 REGDIR="$HOME/.config/model-launcher"
 REG="$REGDIR/engines.json"
 UNITDIR="$HOME/.config/systemd/user"
@@ -25,6 +41,12 @@ if [ $UNINSTALL = 1 ]; then
   systemctl --user disable --now model-launcher 2>/dev/null || true
   rm -f "$UNIT"
   echo "removed $UNIT (registry left in place at $REG)"
+  if [ $POWER = 1 ]; then
+    sudo /usr/local/bin/gpu-power off >/dev/null 2>&1 || true
+    sudo systemctl disable gpu-power.service 2>/dev/null || true
+    sudo rm -f /etc/systemd/system/gpu-power.service /etc/sudoers.d/gpu-power /usr/local/bin/gpu-power
+    echo "removed the GPU power-cap control (GPUs left at their driver default; /etc/default/nvidia-power-limit kept)"
+  fi
   systemctl --user daemon-reload 2>/dev/null || true
   exit 0
 fi
@@ -52,6 +74,7 @@ if [ $APPLY = 0 ]; then
   echo "(dry run; re-run with --apply to write)"
   echo "  will install: $UNIT"
   echo "  will seed:    $REG"
+  [ $POWER = 1 ] && echo "  --power: will install /usr/local/bin/gpu-power, gpu-power.service and /etc/sudoers.d/gpu-power (for $ME), via sudo"
   echo "  then: open http://${ts_ip:-127.0.0.1}:8790 and run the onboarding prompt (docs/onboarding-agent-checklist.md)"
   exit 0
 fi
@@ -120,6 +143,10 @@ mkdir -p "$HOME/.local/bin"
 cp "$HERE/bin/llm-switch" "$HOME/.local/bin/llm-switch"
 chmod +x "$HOME/.local/bin/llm-switch"
 systemctl --user daemon-reload
+if [ $POWER = 1 ]; then
+  if [ $nvidia_ok = 1 ]; then install_power || echo "WARN: power-cap install failed (the launcher still works; the power panel stays hidden)"
+  else echo "skip --power: nvidia-smi not found"; fi
+fi
 systemctl --user enable --now model-launcher
 echo "installed and started."
 echo

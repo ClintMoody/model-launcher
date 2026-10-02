@@ -36,6 +36,14 @@
   .pill{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:8px 12px;font-size:12.5px;color:var(--dim)}
   .pill b{color:var(--fg)}
   .note{color:var(--dim);font-size:12px;margin-top:20px;max-width:640px}
+  .power{margin-top:14px;max-width:640px}
+  .power .top{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
+  .power .slide{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:12px 0 8px}
+  .power input[type=range]{flex:1 1 200px;min-width:0;accent-color:var(--accent)}
+  .power .val{font:600 15px ui-monospace,monospace;min-width:60px;text-align:right}
+  .power .presets{display:flex;gap:6px;flex-wrap:wrap}
+  .power .presets button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+  .power .gpus{color:var(--dim);font-size:12.5px;margin-top:10px;display:flex;gap:16px;flex-wrap:wrap}
   code{background:var(--panel2);padding:1px 6px;border-radius:5px;font-size:12px}
 </style>
 </head>
@@ -48,6 +56,16 @@
     <div class="pill">RAM: <b id="ram">—</b></div>
     <div class="pill">Hermes: <b id="hermes">—</b></div>
     <button class="primary" id="sync" onclick="hermesSync()">Sync Hermes to active</button>
+  </div>
+  <div class="card power" id="power" hidden>
+    <div class="top"><h2>GPU power cap</h2><button id="pwrToggle">…</button></div>
+    <div class="meta" id="pwrState" style="min-height:0;margin:6px 0 0"></div>
+    <div class="slide">
+      <input type="range" id="pwrRange" min="100" max="450" step="10" aria-label="cap in watts per GPU">
+      <span class="val" id="pwrVal"></span><button class="primary" id="pwrApply">apply</button>
+    </div>
+    <div class="presets" id="pwrPresets"></div>
+    <div class="gpus" id="pwrGpus"></div>
   </div>
   <div class="note">One engine owns the GPU at a time. The <b>default</b> badge marks the rollback target.
     A switch stops everything, waits for the GPU to free, starts the target, waits for its health endpoint,
@@ -91,9 +109,10 @@
           </div>`;
         }).join("");
       }
-      $("gpu").textContent=(d.gpus||[]).map(g=>`#${g.index} ${g.mem_used}/${g.mem_total}MiB`).join("   ")||"—";
-      const r=d.ram||{}; $("ram").textContent=r.total?`${(r.used/1024).toFixed(0)}/${(r.total/1024).toFixed(0)}G`:"—";
-      const h=d.hermes||{}; $("hermes").textContent=`${h.reasoning_effort||"off"} · ${h.max_concurrent_children||"-"} children · ${h.stale_timeout_seconds||"-"}s stale`;
+      $("gpu").textContent=(d.gpus||[]).map(g=>`#${g.index} ${g.used}/${g.total}MiB`).join("   ")||"—";
+      const r=d.ram||{}; $("ram").textContent=r.total_gb?`${r.used_gb.toFixed(0)}/${r.total_gb.toFixed(0)}G`:"—";
+      const h=d.hermes||{}; $("hermes").textContent=`${h.reasoning||"off"} · ${h.children||"-"} children · ${h.stale_timeout||"-"}s stale`;
+      renderPower(d.power);
       // progress bar on the active/switching card
       if(d.job&&d.job.target&&d.job.progress){
         const t=d.job.target, bar=$("bar-"+t);
@@ -105,6 +124,36 @@
           $("bs-"+t).textContent=d.job.started?`started ${new Date(d.job.started*1000).toLocaleTimeString()}`:"";
         }
       }
+    }
+    let pwrDraft=null;   // slider moved but not applied yet
+    function renderPower(P){
+      const box=$("power");
+      if(!P||!P.available||!P.gpus||!P.gpus.length){box.hidden=true;return;}
+      box.hidden=false;
+      const def=P.gpus[0].default, lo=Math.max(...P.gpus.map(g=>g.min)), hi=Math.min(...P.gpus.map(g=>g.max));
+      $("pwrState").innerHTML=P.enabled
+        ? `capped at <b style="color:var(--warn)">${P.cap} W</b> per GPU (driver default ${def} W) · applies live and at boot`
+        : `<b style="color:var(--ok)">uncapped</b> · driver default ${def} W${P.cap?` · saved cap ${P.cap} W`:""}`;
+      const tg=$("pwrToggle");
+      tg.textContent=P.enabled?"turn cap off":(P.cap?`turn cap on (${P.cap} W)`:"no saved cap");
+      tg.disabled=!P.enabled&&!P.cap;
+      tg.onclick=()=>setPower(P.enabled?{action:"off"}:{action:"on"});
+      const r=$("pwrRange"); r.min=lo; r.max=hi;
+      if(pwrDraft===null) r.value=P.enabled?P.cap:def;
+      const v=+r.value; $("pwrVal").textContent=v+" W";
+      $("pwrApply").disabled=P.enabled&&v===P.cap;
+      $("pwrApply").onclick=()=>setPower(v>=def?{action:"off"}:{action:"set",watts:v});
+      const pre=[...new Set([Math.round(def*0.55/10)*10,Math.round(def*0.7/10)*10,Math.round(def*0.85/10)*10])].filter(w=>w>=lo&&w<def);
+      $("pwrPresets").innerHTML=pre.concat([def]).map(w=>{
+        const on=w===def?!P.enabled:(P.enabled&&P.cap===w);
+        return `<button class="${on?"on":""}" onclick='setPower(${w===def?'{"action":"off"}':`{"action":"set","watts":${w}}`})'>${w} W${w===def?" (off)":""}</button>`;}).join("");
+      $("pwrGpus").innerHTML=P.gpus.map(g=>`<span>GPU ${g.index}: <b style="color:var(--fg)">${g.draw!=null?Math.round(g.draw):"?"} W</b> of ${g.limit} W</span>`).join("");
+    }
+    $("pwrRange").oninput=e=>{pwrDraft=+e.target.value; if(last) renderPower(last.power);};
+    function setPower(body){
+      fetch("/api/power",{method:"POST",headers:H.headers,body:JSON.stringify(body)})
+        .then(r=>r.json().then(j=>{ pwrDraft=null; if(!r.ok) alert(j.error||"power change failed"); }))
+        .then(refresh).catch(e=>alert("power error: "+e));
     }
     function doSwitch(id,preempt){
       fetch("/api/switch",{method:"POST",headers:H.headers,body:JSON.stringify({target:id,preempt:preempt,rollback:true})})
