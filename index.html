@@ -109,9 +109,9 @@
           </div>`;
         }).join("");
       }
-      $("gpu").textContent=(d.gpus||[]).map(g=>`#${g.index} ${g.mem_used}/${g.mem_total}MiB`).join("   ")||"—";
-      const r=d.ram||{}; $("ram").textContent=r.total?`${(r.used/1024).toFixed(0)}/${(r.total/1024).toFixed(0)}G`:"—";
-      const h=d.hermes||{}; $("hermes").textContent=`${h.reasoning_effort||"off"} · ${h.max_concurrent_children||"-"} children · ${h.stale_timeout_seconds||"-"}s stale`;
+      $("gpu").textContent=(d.gpus||[]).map(g=>`#${g.index} ${g.used}/${g.total}MiB`).join("   ")||"—";
+      const r=d.ram||{}; $("ram").textContent=r.total_gb?`${r.used_gb.toFixed(0)}/${r.total_gb.toFixed(0)}G`:"—";
+      const h=d.hermes||{}; $("hermes").textContent=`${h.reasoning||"off"} · ${h.children||"-"} children · ${h.stale_timeout||"-"}s stale`;
       renderPower(d.power);
       // progress bar on the active/switching card
       if(d.job&&d.job.target&&d.job.progress){
