@@ -15,7 +15,7 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MOCKBIN = os.path.join(ROOT, "tests", "mockbin")
 
-def _start_server(base):
+def _start_server(base, extra=None):
     """Start server.py against a temp registry + mock tools; return (proc, env)."""
     env = {
         "PATH": MOCKBIN + ":" + os.environ.get("PATH", ""),
@@ -26,6 +26,7 @@ def _start_server(base):
         "LAUNCHER_BIND": "127.0.0.1",
         "HOME": os.path.join(base, "home"),
     }
+    env.update(extra or {})
     os.makedirs(os.path.join(env["HOME"], ".hermes"), exist_ok=True)
     open(os.path.join(env["HOME"], ".hermes", "config.yaml"), "w").write(
         "model:\n  provider: custom\nagent:\n  reasoning_effort: none\ndelegation:\n  max_concurrent_children: 2\n  child_timeout_seconds: 3600\nproviders:\n  custom:\n    stale_timeout_seconds: 1800\n")

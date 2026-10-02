@@ -1,10 +1,23 @@
 #!/bin/bash
-# mock nvidia-smi
-for a in "$@"; do
-  case "$a" in
+# mock nvidia-smi: two GPUs. Power limits persist in $MOCK_SMI_STATE (default 450 W each; min 100, max 450).
+ST="${MOCK_SMI_STATE:-/dev/null}"
+lim() { local v; v=$(sed -n "$(( $1 + 1 ))p" "$ST" 2>/dev/null); echo "${v:-450}"; }
+setlim() { local a b; a=$(lim 0); b=$(lim 1); [ "$1" = 0 ] && a=$2; [ "$1" = 1 ] && b=$2; [ "$1" = all ] && a=$2 && b=$2; [ "$ST" != /dev/null ] && printf '%s\n%s\n' "$a" "$b" > "$ST"; }
+idx=all
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -i) idx=$2; shift ;;
+    -pl) setlim "$idx" "$2"; shift ;;
+    -pm|-L) ;;
     *query-gpu=memory.used*) printf '0\n0\n' ;;        # both GPUs free
     *query-gpu=index,memory.used*) printf '0, 0\n1, 0\n' ;;
+    *query-gpu=index,power.limit,power.default_limit,power.min_limit,power.max_limit,power.draw*)
+      printf '0, %s.00, 450.00, 100.00, 450.00, 30.50\n1, %s.00, 450.00, 100.00, 450.00, [N/A]\n' "$(lim 0)" "$(lim 1)" ;;
+    *query-gpu=power.min_limit,power.max_limit*) printf '100.00, 450.00\n100.00, 450.00\n' ;;
+    *query-gpu=power.default_limit*) printf '450.00\n450.00\n' ;;
+    *query-gpu=index,power.default_limit*) printf '0, 450.00\n1, 450.00\n' ;;
     *query-compute-apps*) printf '' ;;
   esac
+  shift
 done
 exit 0

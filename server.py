@@ -19,6 +19,7 @@ Stdlib only. Binds to 127.0.0.1 + the detected Tailscale IP (never the LAN).
   POST /api/hermes-sync   match Hermes to whatever is serving (token)
   GET  /api/journal       switch log since a cursor
   POST /api/config        set the bind list + the bearer token (token)
+  POST /api/power         GPU power cap {"action": "on"|"off"|"set", "watts": int} (token)
 Auth: read endpoints open; mutating endpoints require the bearer token (Authorization or
 X-Launcher-Token). The token lives in the registry config block. Tailscale is the trust boundary.
 """
@@ -37,6 +38,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PORT = int(os.environ.get("LAUNCHER_PORT", "8790"))
 BIND = os.environ.get("LAUNCHER_BIND", "127.0.0.1").split(",")
 SWITCH = os.path.join(HERE, "bin", "llm-switch")
+# GPU power cap: root-owned helper installed by `install.sh --power --apply`; status needs no root,
+# changes go through a NOPASSWD sudo rule scoped to this one binary.
+GPU_POWER = os.environ.get("LAUNCHER_GPU_POWER", "/usr/local/bin/gpu-power")
+SUDO = os.environ.get("LAUNCHER_SUDO", "sudo -n").split()
 REGPATH = os.environ.get("LAUNCHER_REGISTRY",
                          os.path.expanduser("~/.config/model-launcher/engines.json"))
 LOGF = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "model-launcher-switch.log")
@@ -156,6 +161,36 @@ def gpus():
             out.append({"index": int(p[0]), "used": int(p[1]), "total": int(p[2]), "temp": int(p[3]),
                         "power": float(p[4]) if p[4] not in ("[N/A]", "") else None})
     return out
+
+
+def gpu_power():
+    """Power-cap state from gpu-power, or available=False when the helper is not installed."""
+    if not os.access(GPU_POWER, os.X_OK):
+        return {"available": False}
+    try:
+        return dict(json.loads(sh([GPU_POWER, "status"])), available=True)
+    except ValueError:
+        return {"available": False, "error": "gpu-power status failed"}
+
+
+def set_gpu_power(action, watts=None):
+    if action not in ("on", "off", "set"):
+        return 400, {"error": f"unknown action {action}"}
+    if not os.access(GPU_POWER, os.X_OK):
+        return 404, {"error": "gpu-power is not installed (run install.sh --power --apply)"}
+    args = SUDO + [GPU_POWER, action]
+    if action == "set":
+        if not isinstance(watts, int) or isinstance(watts, bool):
+            return 400, {"error": "watts must be an integer"}
+        args.append(str(watts))
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=30)
+    except Exception as e:
+        return 500, {"error": str(e)[:200]}
+    if r.returncode:
+        msg = (r.stderr or r.stdout).strip()[:300]
+        return 400, {"error": msg or f"gpu-power exit {r.returncode}"}
+    return 200, {"ok": True, "power": dict(json.loads(r.stdout), available=True)}
 
 
 def ram():
@@ -327,7 +362,7 @@ def status():
     j["progress"] = progress(j) if (j["running"] or j["target"]) else None
     return {"time": time.time(), "active": active, "states": states, "up": up, "models": models,
             "busy": busy, "gpus": gpus(), "ram": ram(), "hermes": hermes_settings(), "job": j,
-            "engines": _engine_dicts(engines), "efforts": EFFORTS}
+            "power": gpu_power(), "engines": _engine_dicts(engines), "efforts": EFFORTS}
 
 
 def _validate_one(eng):
@@ -487,6 +522,8 @@ class H(BaseHTTPRequestHandler):
                     return self.send(409, {"error": "a switch is running; choose the effort for it instead"})
             out = sh([SWITCH, "effort", e], timeout=30)
             return self.send(200, {"ok": True, "message": out})
+        if self.path == "/api/power":
+            return self.send(*set_gpu_power(body.get("action"), body.get("watts")))
         if self.path == "/api/hermes-sync":
             out = sh([SWITCH, "hermes-sync"], timeout=60)
             return self.send(200, {"ok": True, "message": out})

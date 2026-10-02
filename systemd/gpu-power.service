@@ -1,0 +1,15 @@
+[Unit]
+Description=Apply the NVIDIA GPU power cap from /etc/default/nvidia-power-limit (gpu-power)
+After=multi-user.target
+ConditionPathExists=/usr/local/bin/gpu-power
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=360
+# The driver may load on demand after boot: wait up to 5 min for at least one GPU.
+ExecStartPre=/bin/sh -c 'for i in $(seq 60); do nvidia-smi -L >/dev/null 2>&1 && exit 0; sleep 5; done; exit 1'
+ExecStart=/usr/local/bin/gpu-power apply
+
+[Install]
+WantedBy=multi-user.target

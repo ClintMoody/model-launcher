@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# gpu-power - one control point for the NVIDIA power cap (every GPU gets the same cap).
+# Settings live in /etc/default/nvidia-power-limit (ENABLED=0|1, CAP=watts). The boot unit
+# gpu-power.service runs `gpu-power apply`; model-launcher calls it through a NOPASSWD sudo rule
+# that `install.sh --power --apply` writes for the installing user.
+#   gpu-power status        JSON: enabled, cap, and per-GPU limit/default/min/max/draw (no root needed)
+#   gpu-power on            enable the cap (CAP watts on every GPU)
+#   gpu-power off           disable the cap (every GPU back to its driver default); CAP is kept for `on`
+#   gpu-power set <watts>   set CAP (validated against the GPUs' min/max) and enable it
+#   gpu-power apply         apply whatever the config says (boot)
+# Test hooks (ignored under sudo, which resets the environment): GPU_POWER_CONF, GPU_POWER_SMI,
+# GPU_POWER_ALLOW_NONROOT=1.
+set -u
+CONF="${GPU_POWER_CONF:-/etc/default/nvidia-power-limit}"
+SMI="${GPU_POWER_SMI:-nvidia-smi}"
+ENABLED=0
+CAP=0
+[ -r "$CONF" ] && . "$CONF"
+case "$ENABLED" in 0|1) ;; *) ENABLED=0 ;; esac
+case "$CAP" in ''|*[!0-9]*) CAP=0 ;; esac
+
+die() { echo "gpu-power: $*" >&2; exit 1; }
+need_root() { [ "$(id -u)" = 0 ] || [ "${GPU_POWER_ALLOW_NONROOT:-0}" = 1 ] || die "must run as root"; }
+
+query() { "$SMI" --query-gpu="$1" --format=csv,noheader,nounits; }
+
+# most restrictive min/max across GPUs, as integers
+limits() { query power.min_limit,power.max_limit | awk -F', *' 'NR==1{lo=$1;hi=$2} {if($1>lo)lo=$1; if($2<hi)hi=$2} END{printf "%d %d\n", lo+0.999, hi}'; }
+
+default_cap() { query power.default_limit | awk 'NR==1{printf "%d\n", $1}'; }
+
+save() {
+  need_root
+  umask 022
+  printf '# Managed by gpu-power (model-launcher). ENABLED=1 caps every GPU at CAP watts at boot;\n# ENABLED=0 leaves the driver default. `gpu-power off` keeps CAP so `gpu-power on` restores it.\nENABLED=%s\nCAP=%s\n' \
+    "$ENABLED" "$CAP" > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
+}
+
+apply() {
+  need_root
+  "$SMI" -pm 1 >/dev/null 2>&1 || true
+  if [ "$ENABLED" = 1 ] && [ "$CAP" -gt 0 ]; then
+    "$SMI" -pl "$CAP" >/dev/null || die "nvidia-smi -pl $CAP failed"
+  else
+    query index,power.default_limit | while IFS=', ' read -r i d; do
+      "$SMI" -i "$i" -pl "${d%.*}" >/dev/null || die "reset GPU $i to ${d%.*} W failed"
+    done
+  fi
+}
+
+status() {
+  printf '{"enabled":%s,"cap":%s,"gpus":[' "$([ "$ENABLED" = 1 ] && echo true || echo false)" "$CAP"
+  query index,power.limit,power.default_limit,power.min_limit,power.max_limit,power.draw |
+    awk -F', *' '{n=($6 ~ /^[0-9.]+$/)?$6:"null"; printf "%s{\"index\":%d,\"limit\":%.0f,\"default\":%.0f,\"min\":%.0f,\"max\":%.0f,\"draw\":%s}", (NR>1?",":""), $1,$2,$3,$4,$5,n}'
+  echo ']}'
+}
+
+case "${1:-status}" in
+  status) status ;;
+  apply)  apply; status ;;
+  on)
+    [ "$CAP" -gt 0 ] || die "no saved cap yet; use: gpu-power set <watts>"
+    ENABLED=1; save; apply; status ;;
+  off)
+    [ "$CAP" -gt 0 ] || CAP="$(default_cap)"
+    ENABLED=0; save; apply; status ;;
+  set)
+    w="${2:-}"; case "$w" in ''|*[!0-9]*) die "usage: gpu-power set <watts>" ;; esac
+    read -r lo hi < <(limits)
+    [ "$w" -ge "$lo" ] && [ "$w" -le "$hi" ] || die "watts must be $lo-$hi"
+    CAP="$w"; ENABLED=1; save; apply; status ;;
+  *) die "usage: gpu-power status|on|off|set <watts>|apply" ;;
+esac

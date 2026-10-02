@@ -39,6 +39,7 @@ mutating calls are allowed so you can set one.
 | `POST /api/switch` `{target, force?, preempt?, rollback?}` | switch to a registered engine (same flags as `llm-switch`). 202 when it starts; 409 if another switch is running (use `preempt`); 400 if the id is unknown. | token |
 | `POST /api/effort` `{effort}` | set Hermes thinking effort now (off/low/medium/xhigh). | token |
 | `POST /api/hermes-sync` | match Hermes to whatever is serving. | token |
+| `POST /api/power` `{action: "on"\|"off"\|"set", watts?}` | GPU power cap for every GPU, live and kept across reboots. `set` needs integer `watts` within the GPUs' min/max (400 otherwise). `off` keeps the saved cap for `on`. 404 if `gpu-power` is not installed. | token |
 | `POST /api/config` `{bind?, token?}` | set the bind list and/or the bearer token. **First call after install.** | open until a token is set |
 
 **Status codes to expect:** `200` ok · `201` created · `202` switch accepted · `400` bad/unknown ·
@@ -57,6 +58,12 @@ mutating calls are allowed so you can set one.
 5. `POST /api/switch` to the user's default engine, then `POST /api/hermes-sync` so Hermes follows it.
 6. `GET /api/status` and report to the user: which engine is active, the served model, the Hermes
    profile, and the result of each validate.
+
+## GPU power cap
+`GET /api/status` carries a `power` block: `{available, enabled, cap, gpus: [{index, limit, default, min, max, draw}]}`.
+If `available` is false, the optional control was not installed (`install.sh --power --apply`), so
+do not call `/api/power`. Change the cap only when the user asks. It trades speed for heat and power
+draw, and lowering it slows every engine.
 
 ## Invariants (do not violate)
 - **Exactly one engine is `default`** (the rollback target). If you set a new default, clear the old one.
